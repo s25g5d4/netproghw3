@@ -102,7 +102,7 @@ int main()
 
     // Clean exit
     if (client.fd > 2) {
-        close(client.fd);
+        client.close();
     }
 
     cout << "Goodbye." << endl;
@@ -112,7 +112,7 @@ int main()
 static void sigint_safe_exit(int sig)
 {
     if (client.fd > 2) {
-        close(client.fd);
+        client.close();
     }
     std::cerr << "Interrupt.\n" << std::endl;
     exit(1);
@@ -162,7 +162,7 @@ static int login(const char *addr, const char *port, std::string name)
     status = client.send(login_cmd.c_str(), &len);
     if (status < 0) {
         perror("my_send");
-        close(client.fd);
+        client.close();
         return -1;
     }
 
@@ -172,13 +172,13 @@ static int login(const char *addr, const char *port, std::string name)
     status = client.recv_cmd(welcome_msg, &msglen);
     if (status < 0) {
         perror("my_recv_cmd");
-        close(client.fd);
+        client.close();
         client.fd = -1;
         return -1;
     }
     else if (status > 0) {
         std::cout << "Invalid command received." << std::endl;
-        close(client.fd);
+        client.close();
         client.fd = -1;
         return -1;
     }
@@ -197,7 +197,7 @@ static int login(const char *addr, const char *port, std::string name)
         else {
             perror("my_send");
         }
-        close(client.fd);
+        client.close();
         client.fd = -1;
         return -1;
     }
@@ -295,13 +295,13 @@ void *print_msg(void *)
             else {
                 cerr << "Invalid command received. Terminate connection." << endl;
             }
-            close(client.fd);
+            client.close();
             exit(1);
         }
 
         msg_orig[msglen - 1] = '\0';
 
-        if (memcmp(msg_orig, "message ", 8) == 0) {
+        if (memcmp(msg_orig, "message ", 8) == 0 || memcmp(msg_orig, "offline ", 8) == 0) {
             vector<string> cmd = parse_command(msg_orig);
 
             unsigned int msg_start = 0;
@@ -317,7 +317,7 @@ void *print_msg(void *)
             }
             if (msg_start == 0 || msg_end == 0) {
                 cout << "Invalid command received. Terminating connection..." << endl;
-                close(client.fd);
+                client.close();
                 exit(1);
             }
 
@@ -326,7 +326,12 @@ void *print_msg(void *)
             time_t msg_time = static_cast<time_t>(stoul(cmd[1]));
             string time_str = ctime(&msg_time);
             time_str.pop_back();
-            cout << "\r" << time_str << " " << cmd[2] << ": " << msg << endl << "> " << flush;
+            if (cmd[0] == "offline") {
+                cout << "\r" << time_str << " offline message from " << cmd[2] << ": " << msg << endl << "> " << flush;
+            }
+            else {
+                cout << "\r" << time_str << " " << cmd[2] << ": " << msg << endl << "> " << flush;
+            }
         }
         else {
             cout << "\r" << msg_orig << endl << "> " << flush;

@@ -32,6 +32,7 @@ class client : public my_send_recv
 public:
     std::string name;
     struct sockaddr_storage addr;
+    std::vector<std::string> offline_msgs;
 
     client(int fd, std::string name, struct sockaddr_storage addr)
     : my_send_recv(fd), name(name), addr(addr)
@@ -40,11 +41,11 @@ public:
     }
 };
 
-int accept_connection(int sockfd, std::vector<client> &nonlogin_clients);
-int serve_client(fd_set &set, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
-int relay_msg(std::vector<std::string> &cmd, const char *cmd_orig, client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
+static int accept_connection(int sockfd, std::vector<client> &nonlogin_clients);
+static int serve_client(fd_set &set, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
+static int relay_msg(std::vector<std::string> &cmd, const char *cmd_orig, client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
 static int client_leave(client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
-int user_login(fd_set &set, std::vector<client> &nonlogin_clients, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
+static int user_login(fd_set &set, std::vector<client> &nonlogin_clients, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
 static void print_client(client &cl);
 static std::string get_ip(client &cl);
 static std::string get_port(client&cl);
@@ -156,7 +157,7 @@ int main()
         status = select(maxfd, &set, NULL, NULL, NULL);
     }
     
-    cout << "An error has occurred." << endl;
+    perror("select");
 
     close(sockfd);
     
@@ -172,7 +173,7 @@ static void sigint_safe_exit(int sig)
     exit(1);
 }
 
-int client_leave(client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
+static int client_leave(client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
 {
     using namespace std;
 
@@ -199,8 +200,7 @@ int client_leave(client &cl, std::map<std::string, client> &clients, std::map<in
     }
 
     fd_to_client.erase(cl.fd);
-    close(cl.fd);
-    cl.fd = -1;
+    cl.close();
 
     return status;
 }
@@ -320,10 +320,10 @@ static int welcome(client &cl)
     std::cout << "User " << cl.name << " from " << get_ip(cl) << " logged in." << std::endl;
     
     int msglen = static_cast<int>(strlen(welcome_msg));
-    return cl.send(welcome_msg, &msglen);
+    return cl.send(welcome_msg, &msglen, MSG_NOSIGNAL);
 }
 
-int accept_connection(int sockfd, std::vector<client> &nonlogin_clients)
+static int accept_connection(int sockfd, std::vector<client> &nonlogin_clients)
 {
     struct sockaddr_storage client_addr = {};
     socklen_t client_addr_size = sizeof (client_addr);
@@ -341,7 +341,7 @@ int accept_connection(int sockfd, std::vector<client> &nonlogin_clients)
     return 0;
 }
 
-int serve_client(fd_set &set, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
+static int serve_client(fd_set &set, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
 {
     using namespace std;
 
@@ -388,7 +388,7 @@ int serve_client(fd_set &set, std::map<std::string, client> &clients, std::map<i
     return status;
 }
 
-int relay_msg(std::vector<std::string> &cmd, const char *cmd_orig, client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
+static int relay_msg(std::vector<std::string> &cmd, const char *cmd_orig, client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
 {
     using namespace std;
 
@@ -433,6 +433,8 @@ int relay_msg(std::vector<std::string> &cmd, const char *cmd_orig, client &cl, s
     }
 
     msg = "message " + to_string(time(NULL)) + " " + cl.name + " \"" + msg + "\"\n";
+    string offline_msg = msg;
+    offline_msg.replace(0, 7, "offline");
     for (auto peer : msg_peers) {
         if (peer->fd > 0) {
             int len = static_cast<int>(msg.size());
@@ -453,13 +455,15 @@ int relay_msg(std::vector<std::string> &cmd, const char *cmd_orig, client &cl, s
             else {
                 status = 0;
             }
+
+            peer->offline_msgs.push_back(offline_msg);
         }
     }
 
     return status;
 }
 
-int user_login(fd_set &set, std::vector<client> &nonlogin_clients, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
+static int user_login(fd_set &set, std::vector<client> &nonlogin_clients, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
 {
     using namespace std;
 
@@ -485,7 +489,7 @@ int user_login(fd_set &set, std::vector<client> &nonlogin_clients, std::map<std:
             else {
                 cout << "Invalid command received. Terminating connection..." << endl;
             }
-            close(cl.fd);
+            cl.close();
             it = nonlogin_clients.erase(it);
             continue;
         }
@@ -506,18 +510,28 @@ int user_login(fd_set &set, std::vector<client> &nonlogin_clients, std::map<std:
                     int len = reason.size();
                     cl.send(reason.c_str(), &len, MSG_NOSIGNAL);
 
-                    close(cl.fd);
+                    cl.close();
                     it = nonlogin_clients.erase(it);
                     continue;
                 }
-                inserted.first->second = cl;
+                
+                inserted.first->second.fd = cl.fd;
             }
 
             fd_to_client.insert(make_pair(cl.fd, &(inserted.first->second)));
+            client &cl_inserted = inserted.first->second;
 
-            welcome(cl);
+            welcome(cl_inserted);
+            for (auto &msg : cl_inserted.offline_msgs) {
+                int len = static_cast<int>(msg.size());
+                status = cl_inserted.send(msg.c_str(), &len, MSG_NOSIGNAL);
+                if (status < 0) {
+                    break;
+                }
+            }
+            cl_inserted.offline_msgs.clear();
 
-            string login_notify = "User " + cmd[1] + " is on-line, IP address: " + get_ip(cl) + "\n";
+            string login_notify = "User " + cmd[1] + " is on-line, IP address: " + get_ip(cl_inserted) + "\n";
             for (auto it = clients.begin(); it != clients.end(); ++it) {
                 int len = static_cast<int>(login_notify.size());
                 it->second.send(login_notify.c_str(), &len, MSG_NOSIGNAL);

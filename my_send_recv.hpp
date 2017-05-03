@@ -11,10 +11,15 @@ class my_send_recv
 public:
     int fd;
 
-    my_send_recv(int fd) : fd(fd)
+    my_send_recv(int fd) : in_buflen(0), fd(fd)
     {
-        in_buflen = 0;
     }
+
+    /**
+    * Description: Clean internal buffer and set fd to -1. Must be called if a
+    *              client exited.
+    */
+    void close();
 
     /**
     * Description: Try to write `buflen` bytes of message of `buf` to `fd`.
