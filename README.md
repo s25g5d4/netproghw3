@@ -17,12 +17,12 @@ For client, please run `./client`, and connect to server by command
 
 ## Work
 
-+ Socket connection (i.e., connect and bye commands)
-- Off‐line messages
-+ User name & IP mapping
-+ Chat command (unicast & multicast)
-+ User interface (for example, welcome message or help command)
-+ Code comments & README file
+* ✔ Socket connection (i.e., connect and bye commands)
+* ✗ Off‐line messages
+* ✔ User name & IP mapping
+* ✔ Chat command (unicast & multicast)
+* ✔ User interface (for example, welcome message or help command)
+* ✔ Code comments & README file
 
-`+`: implemented.
-`-`: not implemented.
+`✔`: implemented.
+`✗`: not implemented.
