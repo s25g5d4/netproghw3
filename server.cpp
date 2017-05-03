@@ -40,7 +40,11 @@ public:
     }
 };
 
+int accept_connection(int sockfd, std::vector<client> &nonlogin_clients);
+int serve_client(fd_set &set, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
+int relay_msg(std::vector<std::string> &cmd, const char *cmd_orig, client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
 static int client_leave(client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
+int user_login(fd_set &set, std::vector<client> &nonlogin_clients, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client);
 static void print_client(client &cl);
 static std::string get_ip(client &cl);
 static std::string get_port(client&cl);
@@ -100,183 +104,28 @@ int main()
     FD_ZERO(&set);
     FD_SET(sockfd, &set);
     int maxfd = sockfd + 1;
+
     vector<client> nonlogin_clients;
     map<string, client> clients;
     map<int, client *> fd_to_client;
 
     status = select(maxfd, &set, NULL, NULL, NULL);
     while (status >= 0) {
-        cout << "select" << endl;
         if (FD_ISSET(sockfd, &set)) {
-            struct sockaddr_storage client_addr = {};
-            socklen_t client_addr_size = sizeof (client_addr);
-
-            // Accept client connecting.
-            int clientfd = accept(sockfd, reinterpret_cast<struct sockaddr *>(&client_addr), &client_addr_size);
-            if (clientfd < 0) {
-                perror("accept");
-                status = -1;
-            }
-
-            nonlogin_clients.push_back({ clientfd, "", client_addr });
-            print_client(nonlogin_clients.back());
+            status = accept_connection(sockfd, nonlogin_clients);
         }
 
         if (status < 0) {
             break;
         }
 
-        for (auto it = clients.begin(); it != clients.end(); ++it) {
-            client &cl = it->second;
-            if (cl.fd < 0 || maxfd <= cl.fd || !FD_ISSET(cl.fd, &set)) {
-                continue;
-            }
-
-            char cmd_orig[MAX_CMD];
-            int cmdlen = MAX_CMD;
-            status = cl.recv_cmd(cmd_orig, &cmdlen);
-            if (status < 0) {
-                perror("my_recv_cmd");
-            }
-            if (status > 0) {
-                if (cmdlen == 0) {
-                    cout << "Connection closed by user " << cl.name << "." << endl;
-                }
-                else {
-                    cout << "Invalid command received from user " << cl.name << ". Terminating connection..." << endl;
-                }
-
-                client_leave(cl, clients, fd_to_client);
-                continue;
-            }
-            
-            vector<string> cmd = parse_command(cmd_orig);
-            if (cmd.size() == 0) {
-                continue;
-            }
-            
-            if (cmd[0] == "chat") {
-                unsigned int msg_start = 0;
-                unsigned int msg_end = 0;
-                for (unsigned int i = 6; i < sizeof (cmd_orig) && cmd_orig[i] != '\n'; ++i) {
-                    if (cmd_orig[i] == '"') {
-                        if (msg_start > 0) {
-                            msg_end = i;
-                            break;
-                        }
-                        msg_start = i;
-                    }
-                }
-                if (msg_start == 0 || msg_end == 0) {
-                    cout << "Invalid command received. Terminating connection..." << endl;
-                    client_leave(cl, clients, fd_to_client);
-                    continue;
-                }
-
-                string msg(cmd_orig + msg_start + 1, msg_end - msg_start - 1);
-                vector<client *> msg_peers;
-
-                for (unsigned int i = 1; i < cmd.size(); ++i) {
-                    if (cmd[i][0] == '"') {
-                        break;
-                    }
-
-                    auto peer = clients.find(cmd[i]);
-                    if (peer == clients.end()) {
-                        string nonexist = "User " + cmd[i] + " does not exist.\n";
-                        int len = static_cast<int>(nonexist.size());
-                        cl.send(nonexist.c_str(), &len, MSG_NOSIGNAL);
-                        msg_peers.clear();
-                        break;
-                    }
-
-                    msg_peers.push_back(&peer->second);
-                }
-
-                msg = "message " + to_string(time(NULL)) + " " + cl.name + " " + msg + "\n";
-                for (auto peer : msg_peers) {
-                    if (peer->fd > 0) {
-                        int len = static_cast<int>(msg.size());
-                        status = peer->send(msg.c_str(), &len, MSG_NOSIGNAL);
-                    }
-                    if (peer->fd < 0 || (status < 0 && errno == EPIPE)) {
-                        string offline = "User " + peer->name + " is off-line. The message will be passed when he comes back.\n";
-                        int len = static_cast<int>(offline.size());
-                        cl.send(offline.c_str(), &len, MSG_NOSIGNAL);
-                        status = 0;
-                    }
-                }
-            }
-        }
+        status = serve_client(set, clients, fd_to_client);
 
         if (status < 0) {
             break;
         }
 
-        for (auto it = nonlogin_clients.begin(); it != nonlogin_clients.end(); ) {
-            client &cl = *it;
-            if (maxfd <= cl.fd || !FD_ISSET(it->fd, &set)) {
-                ++it;
-                continue;
-            }
-
-            char cmd_orig[MAX_CMD];
-            int cmdlen = MAX_CMD;
-            status = cl.recv_cmd(cmd_orig, &cmdlen);
-            if (status < 0) {
-                perror("my_recv_cmd");
-            }
-            if (status > 0) {
-                if (cmdlen == 0) {
-                    cout << "Connection closed by peer." << endl;
-                }
-                else {
-                    cout << "Invalid command received. Terminating connection..." << endl;
-                }
-                close(cl.fd);
-                it = nonlogin_clients.erase(it);
-                continue;
-            }
-            
-            vector<string> cmd = parse_command(cmd_orig);
-            if (cmd.size() == 0) {
-                ++it;
-                continue;
-            }
-            if (cmd[0] == "user") {
-                cl.name = cmd[1];
-                auto inserted = clients.insert(make_pair(cmd[1], cl));
-
-                // user exists
-                if (!inserted.second) {
-                    if (inserted.first->second.fd > 0) {
-                        string reason = "User " + cmd[1] + " has logged in.\n";
-                        int len = reason.size();
-                        cl.send(reason.c_str(), &len, MSG_NOSIGNAL);
-
-                        close(cl.fd);
-                        it = nonlogin_clients.erase(it);
-                        continue;
-                    }
-                    inserted.first->second = cl;
-                }
-
-                fd_to_client.insert(make_pair(cl.fd, &(inserted.first->second)));
-
-                welcome(cl);
-
-                string login_notify = "User " + cmd[1] + " is on-line, IP address: " + get_ip(cl) + "\n";
-                for (auto it = clients.begin(); it != clients.end(); ++it) {
-                    int len = static_cast<int>(login_notify.size());
-                    it->second.send(login_notify.c_str(), &len, MSG_NOSIGNAL);
-                }
-
-                it = nonlogin_clients.erase(it);
-                continue;
-            }
-
-            ++it;
-        }
+        status = user_login(set, nonlogin_clients, clients, fd_to_client);
 
         if (status < 0) {
             break;
@@ -285,6 +134,7 @@ int main()
         FD_ZERO(&set);
         FD_SET(sockfd, &set);
         maxfd = sockfd + 1;
+
         for (auto &cl : clients) {
             if (cl.second.fd > 0) {
                 FD_SET(cl.second.fd, &set);
@@ -311,6 +161,15 @@ int main()
     close(sockfd);
     
     return 1;
+}
+
+static void sigint_safe_exit(int sig)
+{
+    if (sockfd > 2) {
+        close(sockfd);
+    }
+    std::cerr << "Interrupt." << std::endl;
+    exit(1);
 }
 
 int client_leave(client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
@@ -344,15 +203,6 @@ int client_leave(client &cl, std::map<std::string, client> &clients, std::map<in
     cl.fd = -1;
 
     return status;
-}
-
-static void sigint_safe_exit(int sig)
-{
-    if (sockfd > 2) {
-        close(sockfd);
-    }
-    std::cerr << "Interrupt." << std::endl;
-    exit(1);
 }
 
 static const void *get_in_addr(const struct sockaddr &sa)
@@ -471,4 +321,214 @@ static int welcome(client &cl)
     
     int msglen = static_cast<int>(strlen(welcome_msg));
     return cl.send(welcome_msg, &msglen);
+}
+
+int accept_connection(int sockfd, std::vector<client> &nonlogin_clients)
+{
+    struct sockaddr_storage client_addr = {};
+    socklen_t client_addr_size = sizeof (client_addr);
+
+    // Accept client connecting.
+    int clientfd = accept(sockfd, reinterpret_cast<struct sockaddr *>(&client_addr), &client_addr_size);
+    if (clientfd < 0) {
+        perror("accept");
+        return -1;
+    }
+
+    nonlogin_clients.push_back({ clientfd, "", client_addr });
+    print_client(nonlogin_clients.back());
+
+    return 0;
+}
+
+int serve_client(fd_set &set, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
+{
+    using namespace std;
+
+    int status = 0;
+
+    for (auto it = clients.begin(); it != clients.end(); ++it) {
+        client &cl = it->second;
+        if (cl.fd < 0 || !FD_ISSET(cl.fd, &set)) {
+            continue;
+        }
+
+        char cmd_orig[MAX_CMD];
+        int cmdlen = MAX_CMD;
+        status = cl.recv_cmd(cmd_orig, &cmdlen);
+        if (status < 0) {
+            perror("my_recv_cmd");
+        }
+        if (status > 0) {
+            if (cmdlen == 0) {
+                cout << "Connection closed by user " << cl.name << "." << endl;
+            }
+            else {
+                cout << "Invalid command received from user " << cl.name << ". Terminating connection..." << endl;
+            }
+
+            client_leave(cl, clients, fd_to_client);
+            continue;
+        }
+        
+        vector<string> cmd = parse_command(cmd_orig);
+        if (cmd.size() == 0) {
+            continue;
+        }
+        
+        if (cmd[0] == "chat") {
+            status = relay_msg(cmd, cmd_orig, cl, clients, fd_to_client);
+        }
+
+        if (status < 0) {
+            break;
+        }
+    }
+
+    return status;
+}
+
+int relay_msg(std::vector<std::string> &cmd, const char *cmd_orig, client &cl, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
+{
+    using namespace std;
+
+    int status = 0;
+
+    size_t cmd_len = strlen(cmd_orig);
+    unsigned int msg_start = 0;
+    unsigned int msg_end = 0;
+    for (unsigned int i = 6; i < cmd_len && cmd_orig[i] != '\n'; ++i) {
+        if (cmd_orig[i] == '"') {
+            if (msg_start > 0) {
+                msg_end = i;
+                break;
+            }
+            msg_start = i;
+        }
+    }
+    if (msg_start == 0 || msg_end == 0) {
+        cout << "Invalid command received. Terminating connection..." << endl;
+        client_leave(cl, clients, fd_to_client);
+        return status;
+    }
+
+    string msg(cmd_orig + msg_start + 1, msg_end - msg_start - 1);
+    vector<client *> msg_peers;
+
+    for (unsigned int i = 1; i < cmd.size(); ++i) {
+        if (cmd[i][0] == '"') {
+            break;
+        }
+
+        auto peer = clients.find(cmd[i]);
+        if (peer == clients.end()) {
+            string nonexist = "User " + cmd[i] + " does not exist.\n";
+            int len = static_cast<int>(nonexist.size());
+            cl.send(nonexist.c_str(), &len, MSG_NOSIGNAL);
+            msg_peers.clear();
+            break;
+        }
+
+        msg_peers.push_back(&peer->second);
+    }
+
+    msg = "message " + to_string(time(NULL)) + " " + cl.name + " \"" + msg + "\"\n";
+    for (auto peer : msg_peers) {
+        if (peer->fd > 0) {
+            int len = static_cast<int>(msg.size());
+            status = peer->send(msg.c_str(), &len, MSG_NOSIGNAL);
+            if (status < 0) {
+                perror("my_send");
+                break;
+            }
+        }
+        if (peer->fd < 0 || (status < 0 && errno == EPIPE)) {
+            string offline = "User " + peer->name + " is off-line. The message will be passed when he comes back.\n";
+            int len = static_cast<int>(offline.size());
+            status = cl.send(offline.c_str(), &len, MSG_NOSIGNAL);
+            if (status < 0) {
+                perror("my_send");
+                break;
+            }
+            else {
+                status = 0;
+            }
+        }
+    }
+
+    return status;
+}
+
+int user_login(fd_set &set, std::vector<client> &nonlogin_clients, std::map<std::string, client> &clients, std::map<int, client *> &fd_to_client)
+{
+    using namespace std;
+
+    int status = 0;
+
+    for (auto it = nonlogin_clients.begin(); it != nonlogin_clients.end(); ) {
+        client &cl = *it;
+        if (!FD_ISSET(it->fd, &set)) {
+            ++it;
+            continue;
+        }
+
+        char cmd_orig[MAX_CMD];
+        int cmdlen = MAX_CMD;
+        status = cl.recv_cmd(cmd_orig, &cmdlen);
+        if (status < 0) {
+            perror("my_recv_cmd");
+        }
+        if (status > 0) {
+            if (cmdlen == 0) {
+                cout << "Connection closed by peer." << endl;
+            }
+            else {
+                cout << "Invalid command received. Terminating connection..." << endl;
+            }
+            close(cl.fd);
+            it = nonlogin_clients.erase(it);
+            continue;
+        }
+        
+        vector<string> cmd = parse_command(cmd_orig);
+        if (cmd.size() == 0) {
+            ++it;
+            continue;
+        }
+        if (cmd[0] == "user") {
+            cl.name = cmd[1];
+            auto inserted = clients.insert(make_pair(cmd[1], cl));
+
+            // user exists
+            if (!inserted.second) {
+                if (inserted.first->second.fd > 0) {
+                    string reason = "User " + cmd[1] + " has logged in.\n";
+                    int len = reason.size();
+                    cl.send(reason.c_str(), &len, MSG_NOSIGNAL);
+
+                    close(cl.fd);
+                    it = nonlogin_clients.erase(it);
+                    continue;
+                }
+                inserted.first->second = cl;
+            }
+
+            fd_to_client.insert(make_pair(cl.fd, &(inserted.first->second)));
+
+            welcome(cl);
+
+            string login_notify = "User " + cmd[1] + " is on-line, IP address: " + get_ip(cl) + "\n";
+            for (auto it = clients.begin(); it != clients.end(); ++it) {
+                int len = static_cast<int>(login_notify.size());
+                it->second.send(login_notify.c_str(), &len, MSG_NOSIGNAL);
+            }
+
+            it = nonlogin_clients.erase(it);
+            continue;
+        }
+
+        ++it;
+    }
+
+    return status;
 }

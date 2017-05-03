@@ -7,7 +7,7 @@
 #include <cstring>
 
 #include "commons.hpp"
-#include "my_huffman.hpp"
+#include "my_send_recv.hpp"
 
 extern "C" {
 #include <sys/types.h>
@@ -19,11 +19,10 @@ extern "C" {
 #include <netdb.h>
 #include <errno.h>
 #include <libgen.h>
-
-#include "my_send_recv.h"
+#include <pthread.h>
 }
 
-int sockfd = 0;
+struct my_send_recv client(-1);
 
 /**
  * Descrption: Clean exit when SIGINT received.
@@ -34,19 +33,21 @@ static void sigint_safe_exit(int sig);
  * Descrption: Connect and login to server.
  * Return: 0 if succeed, or -1 if fail.
  */
-static int login(const char *addr, const char *port);
+static int login(const char *addr, const char *port, std::string name);
 
 /**
- * Descrption: Check and parse user input and run login command.
+ * Descrption: Check and parse user input and run connect command.
  * Return: 0 if succeed, or -1 if fail.
  */
-static int run_login(std::vector<std::string> &cmd);
+static int run_connect(std::vector<std::string> &cmd);
 
 /**
- * Descrption: Check and parse user input and send file to server.
+ * Descrption: Send chatting.
  * Return: 0 if succeed, or -1 if fail.
  */
-static int run_send(std::vector<std::string> &cmd, std::string &orig_cmd);
+static int run_chat(std::vector<std::string> &cmd, std::string &cmd_orig);
+
+void *print_msg(void *);
 
 int main()
 {
@@ -63,23 +64,34 @@ int main()
     // Prompt for user command
     while (true) {
         cout << "> " << flush;
-        string orig_cmd;
-        getline(cin, orig_cmd);
-        vector<string> cmd = parse_command(orig_cmd);
+        string cmd_orig;
+        getline(cin, cmd_orig);
+        vector<string> cmd = parse_command(cmd_orig);
         if (cmd.size() == 0) {
             continue;
         }
 
         // Run command
-        if (cmd[0] == "login") {
-            run_login(cmd);
+        if (cmd[0] == "connect") {
+            if (run_connect(cmd) == 0) {
+                pthread_t tid;
+                pthread_create(&tid, NULL, print_msg, NULL);
+            }
         }
-        else if (cmd[0] == "send") {
-            if (run_send(cmd, orig_cmd) < 0) {
+        else if (cmd[0] == "chat") {
+            if (run_chat(cmd, cmd_orig) < 0) {
                 break;
             }
         }
-        else if (cmd[0] == "logout" || cmd[0] == "exit") {
+        else if (cmd[0] == "help") {
+            cout << "Available commands:" << endl;
+            cout << endl;
+            cout << "connect <IP> <port> <username>" << endl;
+            cout << "chat <user>[ user[ user]...] \"message\"" << endl;
+            cout << "bye" << endl;
+            cout << endl;
+        }
+        else if (cmd[0] == "bye" || cmd[0] == "exit") {
             break;
         }
         else {
@@ -89,8 +101,8 @@ int main()
     }
 
     // Clean exit
-    if (sockfd > 2) {
-        close(sockfd);
+    if (client.fd > 2) {
+        close(client.fd);
     }
 
     cout << "Goodbye." << endl;
@@ -99,14 +111,14 @@ int main()
 
 static void sigint_safe_exit(int sig)
 {
-    if (sockfd > 2) {
-        close(sockfd);
+    if (client.fd > 2) {
+        close(client.fd);
     }
-    fprintf(stderr, "Interrupt.\n");
+    std::cerr << "Interrupt.\n" << std::endl;
     exit(1);
 }
 
-static int login(const char *addr, const char *port)
+static int login(const char *addr, const char *port, std::string name)
 {
     // Resolve hostname and connect
     struct addrinfo hints = {};
@@ -119,6 +131,7 @@ static int login(const char *addr, const char *port)
         return -1;
     }
 
+    int sockfd;
     struct addrinfo *p;
     for (p = res; p != NULL; p = p->ai_next) {
         sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
@@ -142,40 +155,70 @@ static int login(const char *addr, const char *port)
         return -1;
     }
 
+    client.fd = sockfd;
+
+    std::string login_cmd = "user " + name + "\n";
+    int len = static_cast<int>(login_cmd.size());
+    status = client.send(login_cmd.c_str(), &len);
+    if (status < 0) {
+        perror("my_send");
+        close(client.fd);
+        return -1;
+    }
+
     // Read welcome message
-    char welcome_msg[64] = {};
-    int msglen = (int) sizeof (welcome_msg);
-    status = my_recv_cmd(sockfd, welcome_msg, &msglen);
+    char welcome_msg[MAX_CMD] = {};
+    int msglen = static_cast<int>(sizeof (welcome_msg));
+    status = client.recv_cmd(welcome_msg, &msglen);
     if (status < 0) {
         perror("my_recv_cmd");
+        close(client.fd);
+        client.fd = -1;
         return -1;
     }
     else if (status > 0) {
         std::cout << "Invalid command received." << std::endl;
+        close(client.fd);
+        client.fd = -1;
         return -1;
     }
 
     welcome_msg[msglen - 1] = '\0';
     std::cout << welcome_msg << std::endl;
 
+    // test whether connection is closed.
+    const char *peek = "\n";
+    len = 1;
+    status = client.send(peek, &len, MSG_NOSIGNAL);
+    if (status < 0) {
+        if (errno == EPIPE) {
+            std::cout << "Connection closed by peer." << std::endl;
+        }
+        else {
+            perror("my_send");
+        }
+        close(client.fd);
+        client.fd = -1;
+        return -1;
+    }
+
     return 0;
 }
 
-
-static int run_login(std::vector<std::string> &cmd)
+static int run_connect(std::vector<std::string> &cmd)
 {
-    if (cmd.size() < 3) {
+    if (cmd.size() < 4) {
         std::cout << "Invalid command.";
         return -1;
     }
 
-    if (sockfd > 2) {
+    if (client.fd > 2) {
         std::cout << "The connection has been established already." << std::endl;
         return -1;
     }
 
     std::cout << "Connecting to " << cmd[1] << ":" << cmd[2] << std::endl;
-    if (login(cmd[1].c_str(), cmd[2].c_str()) < 0) {
+    if (login(cmd[1].c_str(), cmd[2].c_str(), cmd[3]) < 0) {
         std::cout << "Fail to login." << std::endl;
         return -1;
     }
@@ -183,109 +226,110 @@ static int run_login(std::vector<std::string> &cmd)
     return 0;
 }
 
-static int run_send(std::vector<std::string> &cmd, std::string &orig_cmd)
+static int run_chat(std::vector<std::string> &cmd, std::string &cmd_orig)
 {
     using namespace std;
 
-    if (sockfd <= 2) {
+    if (client.fd <= 2) {
         cout << "You are not logged in yet." << endl;
         return 1;
     }
 
-    if (cmd.size() < 2) {
-        cout << "Please provide file name." << endl;
+    if (cmd.size() < 3) {
+        cout << "Please provide receiver and message." << endl;
         return 1;
     }
 
-    // Get file path
-    string::size_type n = orig_cmd.find(cmd[1]);
-    if (n == string::npos) {
-        cout << "Command error." << endl;
+    size_t msg_start = cmd_orig.find('"', 6);
+    size_t msg_end = msg_start == string::npos ? string::npos : cmd_orig.find('"', msg_start + 1);
+
+    if (msg_start == string::npos || msg_end == string::npos) {
+        cout << "Invalid message." << endl;
         return 1;
     }
 
-    string pathname(orig_cmd.begin() + n, orig_cmd.end());
-
-    ifstream file(pathname, fstream::in | fstream::binary);
-    if (!file.is_open()) {
-        cout << "Failed to open file." << endl;
-        return 1;
+    string msg = "chat ";
+    for (unsigned int i = 1; i < cmd.size(); ++i) {
+        if (cmd[i][0] == '"') {
+            break;
+        }
+        msg += cmd[i] + " ";
     }
 
-    // Get filename
-    // Both dirname() and basename() may modify the contents of path, so it
-    // may be desirable to pass a copy when calling one of these functions.
-    char *pathname_c_str = new char[pathname.size() + 1];
-    memcpy(pathname_c_str, pathname.c_str(), pathname.size() + 1);
+    msg += "\"";
+    msg.append(cmd_orig.begin() + msg_start + 1, cmd_orig.begin() + msg_end);
+    msg += "\"\n";
 
-    string filename = basename(pathname_c_str);
-
-    delete pathname_c_str;
-
-    // Encode with Huffman Coding
-    my_huffman::huffman_encode encoded_file(file);
-
-    uint8_t *buf;
-    int buflen;
-
-    file.seekg(0);
-    encoded_file.write(file, &buf, &buflen);
-
-    // Send command to server
-    string send_cmd = "send " + to_string(buflen) + " " + filename + "\n";
-    int sendlen = static_cast<int>(send_cmd.size());
-    int status = my_send(sockfd, send_cmd.c_str(), &sendlen);
+    // Send msg to server
+    int sendlen = static_cast<int>(msg.size());
+    int status = client.send(msg.c_str(), &sendlen);
     if (status < 0) {
         perror("my_send");
         cout << "Send failed. Terminate conneciton." << endl;
         return -1;
     }
 
-    // Send file to server
-    status = my_send(sockfd, buf, &buflen);
-    if (status < 0) {
-        perror("my_send");
-        cout << "Send failed. Terminate conneciton." << endl;
-        return -1;
-    }
-
-    file.clear();
-    file.seekg(0, file.end);
-
-    cout << "Original file size: " << file.tellg() << "bytes, compressed size: " << buflen << " bytes." << endl;
-    cout.precision(2);
-    cout.setf(ios::fixed);
-    cout << "Compression ratio: " << static_cast<double>(buflen)*100.0 / static_cast<double>(file.tellg()) << "%." << endl;
-
-    // Get response
-    char msg[MAX_CMD];
-    int msglen = MAX_CMD - 1;
-    status = my_recv_cmd(sockfd, msg, &msglen);
-    if (status > 0) {
-        cout << "Invalid response. Terminate conneciton." << endl;
-        return -1;
-    }
-    else if (status < 0) {
-        perror("my_recv_cmd");
-        cout << "Invalid response. Terminate conneciton." << endl;
-        return -1;
-    }
-
-    vector<string> res = parse_command(msg);
-    if (res.size() < 2 || res[0] != "OK") {
-        cout << "Invalid response. Terminate conneciton." << endl;
-        return -1;
-    }
-    
-    int sent;
-    try {
-        sent = stoi(res[1]);
-    }
-    catch (exception &e) {
-        cout << "Invalid response. Terminate conneciton." << endl;
-        return -1;
-    }
-
-    cout << "OK " << sent << " bytes sent." << endl;
     return 0;
+}
+
+void *print_msg(void *)
+{
+    using namespace std;
+
+    while (true) {
+        if (client.fd < 0) {
+            pthread_exit(NULL);
+        }
+
+        char msg_orig[MAX_CMD];
+        int msglen = static_cast<int>(sizeof (msg_orig));
+        int status = client.recv_cmd(msg_orig, &msglen);
+        if (status < 0) {
+            perror("my_recv");
+            pthread_exit(NULL);
+        }
+        else if (status > 0) {
+            if (msglen == 0) {
+                cerr << "Connection closed by peer. Terminate connection." << endl;
+            }
+            else {
+                cerr << "Invalid command received. Terminate connection." << endl;
+            }
+            close(client.fd);
+            exit(1);
+        }
+
+        msg_orig[msglen - 1] = '\0';
+
+        if (memcmp(msg_orig, "message ", 8) == 0) {
+            vector<string> cmd = parse_command(msg_orig);
+
+            unsigned int msg_start = 0;
+            unsigned int msg_end = 0;
+            for (unsigned int i = 6; i < sizeof (msg_orig) && msg_orig[i] != '\n'; ++i) {
+                if (msg_orig[i] == '"') {
+                    if (msg_start > 0) {
+                        msg_end = i;
+                        break;
+                    }
+                    msg_start = i;
+                }
+            }
+            if (msg_start == 0 || msg_end == 0) {
+                cout << "Invalid command received. Terminating connection..." << endl;
+                close(client.fd);
+                exit(1);
+            }
+
+            string msg(msg_orig + msg_start + 1, msg_end - msg_start - 1);
+
+            time_t msg_time = static_cast<time_t>(stoul(cmd[1]));
+            string time_str = ctime(&msg_time);
+            time_str.pop_back();
+            cout << "\r" << time_str << " " << cmd[2] << ": " << msg << endl << "> " << flush;
+        }
+        else {
+            cout << "\r" << msg_orig << endl << "> " << flush;
+        }
+    }
 }
